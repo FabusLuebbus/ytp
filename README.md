@@ -26,8 +26,9 @@ without a URL—make it the first playing track. Press `/` from browse view to
 search again.
 
 Key controls: `Space` pauses, `←`/`→` seek, `Ctrl-←`/`Ctrl-→` change tracks,
-`b` switches between queue and browse, `e` opens the EQ, `f` marks the selected
-queue/browse track, `F` opens Favorites, and `q` quits. In Favorites, `Enter`
+`b` switches between queue and browse, `e` opens the EQ, `f` marks the current
+track in queue view (or the selected browse track), `F` opens Favorites, and
+`q` quits. In Favorites, `Enter`
 plays a track and `f` or `x` removes it. Favorites are stored in
 `config/favorites.json` (or the directory selected by `YTP_CONFIG_DIR`).
 

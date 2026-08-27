@@ -35,6 +35,7 @@ Playback (always available)
   space        play / pause
   <- / ->      seek -15s / +15s
   ctrl+<- / -> previous / next track (also OS/hardware media keys)
+  f            mark/unmark the current track (from the queue view)
   v            toggle visual: rainbow sweep / beat-synced pulse
   q            quit
 
@@ -369,6 +370,8 @@ def run(url=None, initial_search=None):
                 put()
 
                 title_line = f"{current['title']} — {current['channel']}"
+                if current.get("id") in favorites:
+                    title_line = "★ " + title_line
                 put(bold(title_line[:w]))
 
                 dur = mpv.get("duration") or current.get("duration")
@@ -395,7 +398,7 @@ def run(url=None, initial_search=None):
                     list_h = panel_avail - 1
                 elif view == "queue":
                     pos_hint = f" [{queue_selected + 1}/{len(play_queue)}]" if play_queue else ""
-                    legend = f"Queue{pos_hint}  (↑↓ select · ↵ play now · x remove · b browse · p hide · space pause · q quit)"[:w]
+                    legend = f"Queue{pos_hint}  (↑↓ select · ↵ play now · f favorite current · x remove · b browse · p hide · space pause · q quit)"[:w]
                     put(bold(legend))
                     items, selected = play_queue, queue_selected
                     empty_msg = "(queue is empty — press b to browse and add tracks)"
@@ -621,11 +624,11 @@ def run(url=None, initial_search=None):
                     browse_selected = 0
                     browse_scroll = 0
                 elif key.lower() == "f":
-                    if view in ("browse", "queue"):
-                        selected_items = browse_items if view == "browse" else play_queue
-                        selected_index = browse_selected if view == "browse" else queue_selected
-                        if selected_items:
-                            toggle_favorite(favorites, selected_items[selected_index])
+                    if view == "browse":
+                        if browse_items:
+                            toggle_favorite(favorites, browse_items[browse_selected])
+                    elif view == "queue":
+                        toggle_favorite(favorites, current)
                 elif key.lower() == "p":
                     panel_hidden = not panel_hidden
                 elif key.lower() == "q":
