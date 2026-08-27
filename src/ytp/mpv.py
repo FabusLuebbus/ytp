@@ -20,7 +20,8 @@ class Mpv:
         ]
         if MPRIS_SCRIPT and os.path.exists(MPRIS_SCRIPT):
             cmd.append(f"--script={MPRIS_SCRIPT}")
-        cmd.append(url)
+        if url:
+            cmd.append(url)
         self.proc = subprocess.Popen(cmd)
         for _ in range(100):
             if os.path.exists(self.sock):

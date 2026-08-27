@@ -14,7 +14,16 @@ def main() -> None:
         prog="ytp",
         description="A terminal YouTube audio player.",
     )
-    parser.add_argument("url", help="YouTube video or playlist URL")
+    parser.add_argument("query", nargs="?", help="YouTube URL or search string")
     parser.add_argument("--version", action="version", version=f"ytp {__version__}")
     args = parser.parse_args()
-    run(args.url)
+    if not args.query:
+        run(None)
+        return
+    is_url = "://" in args.query or args.query.startswith(
+        ("youtu.be/", "youtube.com/", "www.youtube.com/")
+    )
+    if is_url:
+        run(args.query)
+    else:
+        run(None, initial_search=args.query)

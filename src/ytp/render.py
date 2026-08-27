@@ -163,7 +163,7 @@ def clamp_scroll(offset, selected, total, visible):
     return max(0, min(offset, total - visible))
 
 
-def render_table(items, selected, width, max_rows, offset=0):
+def render_table(items, selected, width, max_rows, offset=0, favorite_ids=None):
     """A bordered ╭─┬─╮ table like haspkg's, showing items[offset:], with
     `selected` (an index into the full `items`) highlighted if it's in
     that visible slice. None tells the caller to fall back to a plain
@@ -189,7 +189,8 @@ def render_table(items, selected, width, max_rows, offset=0):
     )
     lines.append(border_row("├", "┼", "┤"))
     for i, item in enumerate(items[offset:offset + rows_avail]):
-        title = item["title"][:title_w].ljust(title_w)
+        marker = "★ " if favorite_ids and item.get("id") in favorite_ids else "  "
+        title = (marker + item["title"])[:title_w].ljust(title_w)
         dur = fmt_time(item["duration"]).rjust(duration_w)
         chan = item["channel"][:channel_w].ljust(channel_w)
         if i == selected - offset:
@@ -202,10 +203,11 @@ def render_table(items, selected, width, max_rows, offset=0):
     return lines
 
 
-def render_plain_list(items, selected, width, max_rows, offset=0):
+def render_plain_list(items, selected, width, max_rows, offset=0, favorite_ids=None):
     lines = []
     for i, item in enumerate(items[offset:offset + max_rows]):
-        line = f"{item['title'][:60]:60}  {fmt_time(item['duration']):>8}  {item['channel'][:20]}"
+        marker = "★ " if favorite_ids and item.get("id") in favorite_ids else "  "
+        line = f"{(marker + item['title'])[:60]:60}  {fmt_time(item['duration']):>8}  {item['channel'][:20]}"
         lines.append(highlight(line[:width]) if i == selected - offset else line[:width])
     return lines
 

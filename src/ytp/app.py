@@ -12,6 +12,7 @@ from blessed import Terminal
 from .art import DEFAULT_ART, DEFAULT_MED_ART, DEFAULT_SMALL_ART, load_art, pair_speaker
 from .config import ART_PATH, MED_ART_PATH, SMALL_ART_PATH
 from .eq import EQ_ORDER, EQ_RANGE_DB, build_af, load_eq, save_eq
+from .favorites import load_favorites, toggle_favorite
 from .mpv import Mpv
 from .render import (
     CLEAR_EOL,
@@ -42,6 +43,7 @@ Queue view (default)
   enter        play selected track now (drops earlier queued tracks)
   x            remove selected track from queue
   b            switch to browse view
+  F            open favorites
 
 Browse view (pick what to queue next, without interrupting playback)
   up / down    select track
@@ -50,6 +52,12 @@ Browse view (pick what to queue next, without interrupting playback)
   m            back to YouTube's recommended mix
   /            new search
   b            back to queue view
+  f            mark/unmark the selected track
+
+Favorites view
+  up / down    select favorite
+  enter        play favorite now
+  x / f        remove favorite
 
 Equalizer (e to open, from queue or browse)
   <- / ->      select bass / mid / treble
@@ -75,26 +83,37 @@ def run_async(fn, *args):
     return state
 
 
-def run(url):
-    """Start the terminal player for one YouTube URL."""
+def run(url=None, initial_search=None):
+    """Start the terminal player, optionally beginning with a URL or search."""
     term = Terminal()
-    print("Loading…")
-    current = fetch_video(url)
+    if url:
+        print("Loading…")
+        current = fetch_video(url)
+    else:
+        current = {
+            "id": "",
+            "title": "No track selected",
+            "channel": "",
+            "channel_url": None,
+            "duration": None,
+            "url": None,
+        }
 
     play_queue = []
     queue_selected = 0
     queue_scroll = 0
     history = []  # previously played tracks, most recent last; for prev/next
 
-    view = "queue"  # "queue" or "browse"
+    view = "queue"  # "queue" | "browse" | "favorites"
     browse_source = "mix"  # "mix" | "channel" | "search"
     browse_items = []
     browse_selected = 0
     browse_scroll = 0
-    browse_job = run_async(fetch_mix, current["id"])
+    browse_job = run_async(fetch_mix, current["id"]) if current["id"] else None
+    favorites = load_favorites()
 
-    typing = False
-    search_buffer = ""
+    search_buffer = initial_search or ""
+    typing = initial_search is not None
 
     eq_gains = load_eq()
     eq_selected = 0
@@ -102,7 +121,7 @@ def run(url):
     visual_mode = "rainbow"  # "rainbow" (continuous sweep) or "beat" (pulses on the beat)
     beat_info = None
     from .beat import analyze_beat
-    beat_job = run_async(analyze_beat, current["url"])
+    beat_job = run_async(analyze_beat, current["url"]) if current["url"] else None
     next_beat_time = None
     beat_hue = 0.0
     beat_hue_target = 0.0
@@ -128,10 +147,28 @@ def run(url):
 
     def resync_playlist():
         nonlocal cur_pl_index
+        if not current["url"]:
+            return
         prev_url = history[-1]["url"] if history else None
         next_url = play_queue[0]["url"] if play_queue else None
         mpv.sync_playlist(current["url"], prev_url, next_url)
         cur_pl_index = 1 if prev_url else 0
+
+    def start_track(track, clear_queue=False):
+        """Make a browsed/favorite track the active track, including startup."""
+        nonlocal current, play_queue, queue_selected, beat_info, next_beat_time, beat_job
+        if current["url"]:
+            history.append(current)
+            del history[:-20]
+        current = track
+        if clear_queue:
+            play_queue = []
+            queue_selected = 0
+        mpv.load(current["url"])
+        beat_info = None
+        next_beat_time = None
+        beat_job = run_async(analyze_beat, current["url"])
+        resync_playlist()
 
     def advance(forward):
         """Move to the next/previous track (queue <-> history), for the
@@ -139,6 +176,8 @@ def run(url):
         Next/Previous alike. Returns False (no-op) if there's nowhere to
         go -- empty queue for forward, empty history for backward."""
         nonlocal current, browse_selected, browse_job, beat_info, next_beat_time, beat_job, queue_selected
+        if not current["url"]:
+            return False
         if forward:
             if not play_queue:
                 return False
@@ -284,6 +323,17 @@ def run(url):
                 else:
                     art, visual_h = art_small, len(art_small)
 
+                # EQ is a dedicated editing window. Give it at least half of
+                # the terminal for the curve and controls, shrinking the
+                # speaker art when the taller variants would crowd it out.
+                if view == "eq":
+                    eq_panel = (height + 1) // 2
+                    max_eq_visual = height - CORE_LINES - eq_panel
+                    for candidate in (art_tall, art_med, art_small):
+                        if candidate and len(candidate) <= max_eq_visual:
+                            art, visual_h = candidate, len(candidate)
+                            break
+
                 pos = mpv.get("time-pos")
                 if visual_mode == "beat" and beat_info and pos is not None:
                     interval = beat_info["interval"]
@@ -360,6 +410,23 @@ def run(url):
                     if list_h > 0:
                         for line in render_eq_curve(eq_gains, eq_name, w, list_h)[:list_h]:
                             put(line)
+                elif view == "favorites":
+                    favorite_items = list(favorites.values())
+                    pos_hint = f" [{browse_selected + 1}/{len(favorite_items)}]" if favorite_items else ""
+                    legend = f"Favorites{pos_hint}  (↑↓ select · ↵ play now · x/f remove · b back · q quit)"[:w]
+                    put(bold(legend))
+                    items, selected = favorite_items, browse_selected
+                    list_h = panel_avail - 1
+                    empty_msg = "(no favorites yet — press f on a track to add one)"
+                    if list_h > 0 and items:
+                        visible_rows = max(1, list_h - 4)
+                        browse_scroll = clamp_scroll(browse_scroll, selected, len(items), visible_rows)
+                        table = render_table(items, selected, w, list_h, browse_scroll, set(favorites))
+                        table_rows = table or render_plain_list(items, selected, w, list_h, browse_scroll, set(favorites))
+                        for line in table_rows[:list_h]:
+                            put(line)
+                    elif not items:
+                        put(dim(empty_msg))
                 else:
                     label = BROWSE_LABELS[browse_source]
                     pos_hint = f" [{browse_selected + 1}/{len(browse_items)}]" if browse_items else ""
@@ -393,8 +460,8 @@ def run(url):
                         else:
                             browse_scroll = clamp_scroll(browse_scroll, selected, len(items), visible_rows)
                             offset = browse_scroll
-                        table = render_table(items, selected, w, list_h, offset)
-                        table_rows = table if table else render_plain_list(items, selected, w, list_h, offset)
+                        table = render_table(items, selected, w, list_h, offset, set(favorites))
+                        table_rows = table if table else render_plain_list(items, selected, w, list_h, offset, set(favorites))
                         for line in table_rows[:list_h]:
                             put(line)
 
@@ -470,6 +537,14 @@ def run(url):
                         break
                     continue
 
+                if view == "favorites" and key.lower() in ("f", "x"):
+                    favorite_items = list(favorites.values())
+                    if favorite_items:
+                        toggle_favorite(favorites, favorite_items[browse_selected])
+                        favorite_items = list(favorites.values())
+                        browse_selected = min(browse_selected, max(0, len(favorite_items) - 1))
+                    continue
+
                 if key == " ":
                     mpv.toggle_pause()
                 elif key.name == "KEY_LEFT":
@@ -484,6 +559,8 @@ def run(url):
                 elif key.name == "KEY_DOWN":
                     if view == "queue":
                         queue_selected = min(len(play_queue) - 1, queue_selected + 1)
+                    elif view == "favorites":
+                        browse_selected = min(len(favorites) - 1, browse_selected + 1)
                     else:
                         browse_selected = min(len(browse_items) - 1, browse_selected + 1)
                 elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
@@ -502,8 +579,15 @@ def run(url):
                                 browse_job = run_async(fetch_mix, current["id"])
                             resync_playlist()
                     elif view == "browse" and browse_items:
-                        play_queue.append(browse_items[browse_selected])
-                        resync_playlist()
+                        chosen = browse_items[browse_selected]
+                        if not current["url"]:
+                            start_track(chosen)
+                        else:
+                            play_queue.append(chosen)
+                            resync_playlist()
+                    elif view == "favorites" and favorites:
+                        favorite_items = list(favorites.values())
+                        start_track(favorite_items[browse_selected], clear_queue=True)
                 elif key.lower() == "x" and view == "queue" and play_queue:
                     play_queue.pop(queue_selected)
                     queue_selected = min(queue_selected, max(0, len(play_queue) - 1))
@@ -530,6 +614,18 @@ def run(url):
                     search_buffer = ""
                 elif key.lower() == "e":
                     view = "eq"
+                    panel_hidden = False
+                elif key == "F":
+                    view = "favorites"
+                    panel_hidden = False
+                    browse_selected = 0
+                    browse_scroll = 0
+                elif key.lower() == "f":
+                    if view in ("browse", "queue"):
+                        selected_items = browse_items if view == "browse" else play_queue
+                        selected_index = browse_selected if view == "browse" else queue_selected
+                        if selected_items:
+                            toggle_favorite(favorites, selected_items[selected_index])
                 elif key.lower() == "p":
                     panel_hidden = not panel_hidden
                 elif key.lower() == "q":
