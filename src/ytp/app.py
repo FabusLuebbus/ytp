@@ -6,10 +6,12 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 
 from blessed import Terminal
 
 from .art import DEFAULT_ART, DEFAULT_MED_ART, DEFAULT_SMALL_ART, load_art, pair_speaker
+from .beat import analyze_beat
 from .config import ART_PATH, MED_ART_PATH, SMALL_ART_PATH
 from .eq import EQ_ORDER, EQ_RANGE_DB, build_af, load_eq, save_eq
 from .favorites import load_favorites, toggle_favorite
@@ -47,8 +49,8 @@ Queue view (default)
   enter        play selected track now (drops earlier queued tracks)
   x            remove selected track from queue
   b            switch to browse view
-  F            open favorites
-  H            open play history
+  F            open favorites (F again to close)
+  H            open play history (H again to close)
 
 Browse view (pick what to queue next, without interrupting playback)
   up / down    select track
@@ -62,12 +64,13 @@ Browse view (pick what to queue next, without interrupting playback)
 Favorites view
   up / down    select favorite
   enter        play favorite now
-  x / f        remove favorite
+  x            remove favorite
+  b / F        back to queue view
 
 History view
   up / down    select track
   enter        play track now
-  b            back to queue view
+  b / H        back to queue view
 
 Equalizer (e to open, from queue or browse)
   <- / ->      select bass / mid / treble
@@ -93,6 +96,283 @@ def run_async(fn, *args):
     return state
 
 
+@dataclass
+class PlayerState:
+    """All player state that key handling and rendering read or mutate.
+    Kept as one object (rather than a pile of nonlocals) so the key
+    dispatch in handle_key() can be unit tested without a real terminal,
+    mpv process, or network access."""
+
+    current: dict
+    play_queue: list = field(default_factory=list)
+    queue_selected: int = 0
+    queue_scroll: int = 0
+    history: list = field(default_factory=list)
+    history_selected: int = 0
+    history_scroll: int = 0
+    view: str = "queue"  # "queue" | "browse" | "favorites" | "history" | "eq"
+    browse_source: str = "mix"  # "mix" | "channel" | "search"
+    browse_items: list = field(default_factory=list)
+    browse_selected: int = 0
+    browse_scroll: int = 0
+    browse_job: dict | None = None
+    favorites: dict = field(default_factory=dict)
+    search_buffer: str = ""
+    typing: bool = False
+    eq_gains: dict = field(default_factory=dict)
+    eq_selected: int = 0
+    visual_mode: str = "rainbow"  # "rainbow" (continuous sweep) or "beat" (pulses on the beat)
+    beat_info: dict | None = None
+    beat_job: dict | None = None
+    next_beat_time: float | None = None
+    panel_hidden: bool = False
+    showing_help: bool = False
+    cur_pl_index: int = 0  # index of `current` within mpv's own playlist
+
+
+def resync_playlist(state, mpv):
+    if not state.current["url"]:
+        return
+    prev_url = state.history[-1]["url"] if state.history else None
+    next_url = state.play_queue[0]["url"] if state.play_queue else None
+    mpv.sync_playlist(state.current["url"], prev_url, next_url)
+    state.cur_pl_index = 1 if prev_url else 0
+
+
+def remember(state, track):
+    state.history.append(track)
+    del state.history[:-HISTORY_LIMIT]
+    save_history(state.history)
+
+
+def start_track(state, mpv, track, clear_queue=False):
+    """Make a browsed/favorite track the active track, including startup."""
+    if state.current["url"]:
+        remember(state, state.current)
+    state.current = track
+    if clear_queue:
+        state.play_queue = []
+        state.queue_selected = 0
+    mpv.load(state.current["url"])
+    state.beat_info = None
+    state.next_beat_time = None
+    state.beat_job = run_async(analyze_beat, state.current["url"])
+    resync_playlist(state, mpv)
+
+
+def advance(state, mpv, forward):
+    """Move to the next/previous track (queue <-> history), for the
+    Ctrl+Left/Right hotkeys and for playlist-pos-detected OS media-key
+    Next/Previous alike. Returns False (no-op) if there's nowhere to
+    go -- empty queue for forward, empty history for backward."""
+    if not state.current["url"]:
+        return False
+    if forward:
+        if not state.play_queue:
+            return False
+        remember(state, state.current)
+        state.current = state.play_queue.pop(0)
+    else:
+        if not state.history:
+            return False
+        state.play_queue.insert(0, state.current)
+        state.current = state.history.pop()
+        save_history(state.history)
+    state.queue_selected = 0
+    state.beat_info = None
+    state.next_beat_time = None
+    state.beat_job = run_async(analyze_beat, state.current["url"])
+    if state.browse_source == "mix":
+        state.browse_selected = 0
+        state.browse_job = run_async(fetch_mix, state.current["id"])
+    resync_playlist(state, mpv)
+    return True
+
+
+def handle_help_key(key):
+    """Dispatch for the full-screen help overlay. Returns "quit", "close",
+    or None (stay open)."""
+    if key.lower() == "q":
+        return "quit"
+    if key.lower() == "h" or key.name in ("KEY_ESCAPE", "KEY_ENTER") or key == "\x1b":
+        return "close"
+    return None
+
+
+def handle_key(key, state, mpv):
+    """Dispatch one keystroke against the player state, mutating it (and
+    issuing the matching mpv command) in place. Returns True if the app
+    should quit, else None."""
+    if state.typing:
+        if key.name == "KEY_ESCAPE" or key == "\x1b":
+            state.typing = False
+        elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
+            state.typing = False
+            if state.search_buffer.strip():
+                state.view = "browse"
+                state.browse_source = "search"
+                state.browse_items = []
+                state.browse_selected = 0
+                state.browse_job = run_async(fetch_search, state.search_buffer.strip())
+        elif key.name == "KEY_BACKSPACE" or key in ("\x7f", "\x08"):
+            state.search_buffer = state.search_buffer[:-1]
+        elif not key.is_sequence and key.isprintable():
+            state.search_buffer += str(key)
+        return None
+
+    if key == "h":
+        state.showing_help = True
+        return None
+
+    if key.lower() == "v":
+        state.visual_mode = "beat" if state.visual_mode == "rainbow" else "rainbow"
+        return None
+
+    if key.name == "KEY_CTRL_LEFT" or key in ("\x1b[1;5D", "\x1b[5D"):
+        advance(state, mpv, forward=False)
+        return None
+    if key.name == "KEY_CTRL_RIGHT" or key in ("\x1b[1;5C", "\x1b[5C"):
+        advance(state, mpv, forward=True)
+        return None
+
+    if state.view == "eq":
+        name = EQ_ORDER[state.eq_selected]
+        if key.name == "KEY_LEFT":
+            state.eq_selected = (state.eq_selected - 1) % len(EQ_ORDER)
+        elif key.name == "KEY_RIGHT":
+            state.eq_selected = (state.eq_selected + 1) % len(EQ_ORDER)
+        elif key.name == "KEY_UP":
+            state.eq_gains[name] = min(EQ_RANGE_DB, state.eq_gains[name] + 1)
+            mpv.set_af(build_af(state.eq_gains))
+            save_eq(state.eq_gains)
+        elif key.name == "KEY_DOWN":
+            state.eq_gains[name] = max(-EQ_RANGE_DB, state.eq_gains[name] - 1)
+            mpv.set_af(build_af(state.eq_gains))
+            save_eq(state.eq_gains)
+        elif key.lower() == "r":
+            state.eq_gains = {n: 0.0 for n in EQ_ORDER}
+            mpv.set_af(build_af(state.eq_gains))
+            save_eq(state.eq_gains)
+        elif key == " ":
+            mpv.toggle_pause()
+        elif key.lower() == "p":
+            state.panel_hidden = not state.panel_hidden
+        elif key.lower() in ("e", "b"):
+            state.view = "queue"
+        elif key.lower() == "q":
+            return True
+        return None
+
+    if key == " ":
+        mpv.toggle_pause()
+    elif key.name == "KEY_LEFT":
+        mpv.seek(-15)
+    elif key.name == "KEY_RIGHT":
+        mpv.seek(15)
+    elif key.name == "KEY_UP":
+        if state.view == "queue":
+            state.queue_selected = max(0, state.queue_selected - 1)
+        elif state.view == "history":
+            state.history_selected = max(0, state.history_selected - 1)
+        else:
+            state.browse_selected = max(0, state.browse_selected - 1)
+    elif key.name == "KEY_DOWN":
+        if state.view == "queue":
+            state.queue_selected = min(len(state.play_queue) - 1, state.queue_selected + 1)
+        elif state.view == "favorites":
+            state.browse_selected = min(len(state.favorites) - 1, state.browse_selected + 1)
+        elif state.view == "history":
+            state.history_selected = min(len(state.history) - 1, state.history_selected + 1)
+        else:
+            state.browse_selected = min(len(state.browse_items) - 1, state.browse_selected + 1)
+    elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
+        if state.view == "queue" and state.play_queue:
+            if state.queue_selected < len(state.play_queue):
+                remember(state, state.current)
+                state.current = state.play_queue[state.queue_selected]
+                state.play_queue = state.play_queue[state.queue_selected + 1:]
+                state.queue_selected = 0
+                state.beat_info = None
+                state.next_beat_time = None
+                state.beat_job = run_async(analyze_beat, state.current["url"])
+                if state.browse_source == "mix":
+                    state.browse_selected = 0
+                    state.browse_job = run_async(fetch_mix, state.current["id"])
+                resync_playlist(state, mpv)
+        elif state.view == "browse" and state.browse_items:
+            chosen = state.browse_items[state.browse_selected]
+            if not state.current["url"]:
+                start_track(state, mpv, chosen)
+            else:
+                state.play_queue.append(chosen)
+                resync_playlist(state, mpv)
+        elif state.view == "favorites" and state.favorites:
+            favorite_items = list(state.favorites.values())
+            start_track(state, mpv, favorite_items[state.browse_selected], clear_queue=True)
+        elif state.view == "history" and state.history:
+            start_track(state, mpv, list(reversed(state.history))[state.history_selected], clear_queue=True)
+    elif key.lower() == "x" and state.view == "queue" and state.play_queue:
+        state.play_queue.pop(state.queue_selected)
+        state.queue_selected = min(state.queue_selected, max(0, len(state.play_queue) - 1))
+        resync_playlist(state, mpv)
+    elif key.lower() == "x" and state.view == "favorites":
+        favorite_items = list(state.favorites.values())
+        if favorite_items:
+            toggle_favorite(state.favorites, favorite_items[state.browse_selected])
+            favorite_items = list(state.favorites.values())
+            state.browse_selected = min(state.browse_selected, max(0, len(favorite_items) - 1))
+    elif key.lower() == "b":
+        state.view = "browse" if state.view == "queue" else "queue"
+        if state.view == "browse" and not state.browse_items and state.browse_job is None:
+            state.browse_job = run_async(fetch_mix, state.current["id"])
+    elif key.lower() == "c":
+        state.view = "browse"
+        state.browse_source = "channel"
+        state.browse_items = []
+        state.browse_selected = 0
+        state.browse_job = run_async(fetch_channel_videos, state.current.get("channel_url"), state.current["id"])
+    elif key.lower() == "m":
+        state.view = "browse"
+        state.browse_source = "mix"
+        state.browse_items = []
+        state.browse_selected = 0
+        state.browse_job = run_async(fetch_mix, state.current["id"])
+    elif key == "/":
+        state.view = "browse"
+        state.typing = True
+        state.search_buffer = ""
+    elif key.lower() == "e":
+        state.view = "eq"
+        state.panel_hidden = False
+    elif key == "F":
+        if state.view == "favorites":
+            state.view = "queue"
+        else:
+            state.view = "favorites"
+            state.panel_hidden = False
+            state.browse_selected = 0
+            state.browse_scroll = 0
+    elif key == "H":
+        if state.view == "history":
+            state.view = "queue"
+        else:
+            state.view = "history"
+            state.panel_hidden = False
+            state.history_selected = 0
+            state.history_scroll = 0
+    elif key.lower() == "f":
+        if state.view == "browse":
+            if state.browse_items:
+                toggle_favorite(state.favorites, state.browse_items[state.browse_selected])
+        elif state.view == "queue":
+            toggle_favorite(state.favorites, state.current)
+    elif key.lower() == "p":
+        state.panel_hidden = not state.panel_hidden
+    elif key.lower() == "q":
+        return True
+    return None
+
+
 def run(url=None, initial_search=None):
     """Start the terminal player, optionally beginning with a URL or search."""
     term = Terminal()
@@ -109,36 +389,19 @@ def run(url=None, initial_search=None):
             "url": None,
         }
 
-    play_queue = []
-    queue_selected = 0
-    queue_scroll = 0
     history = load_history()  # previously played tracks, most recent last; for prev/next
     del history[:-HISTORY_LIMIT]
-    history_selected = 0
-    history_scroll = 0
 
-    view = "queue"  # "queue" | "browse" | "favorites" | "history"
-    browse_source = "mix"  # "mix" | "channel" | "search"
-    browse_items = []
-    browse_selected = 0
-    browse_scroll = 0
-    browse_job = run_async(fetch_mix, current["id"]) if current["id"] else None
-    favorites = load_favorites()
-
-    search_buffer = initial_search or ""
-    typing = initial_search is not None
-
-    eq_gains = load_eq()
-    eq_selected = 0
-
-    visual_mode = "rainbow"  # "rainbow" (continuous sweep) or "beat" (pulses on the beat)
-    beat_info = None
-    from .beat import analyze_beat
-    beat_job = run_async(analyze_beat, current["url"]) if current["url"] else None
-    next_beat_time = None
-    beat_hue = 0.0
-    beat_hue_target = 0.0
-    beat_flash = 0.0
+    state = PlayerState(
+        current=current,
+        history=history,
+        browse_job=run_async(fetch_mix, current["id"]) if current["id"] else None,
+        favorites=load_favorites(),
+        search_buffer=initial_search or "",
+        typing=initial_search is not None,
+        eq_gains=load_eq(),
+        beat_job=run_async(analyze_beat, current["url"]) if current["url"] else None,
+    )
 
     art_tall = load_art(ART_PATH, DEFAULT_ART)
     art_tall_mtime = os.path.getmtime(ART_PATH)
@@ -147,76 +410,17 @@ def run(url=None, initial_search=None):
     art_small = load_art(SMALL_ART_PATH, DEFAULT_SMALL_ART)
     art_small_mtime = os.path.getmtime(SMALL_ART_PATH)
 
-    panel_hidden = False
-    showing_help = False
-
     MIN_WIDTH = 20
     CORE_LINES = 4  # blank-after-art, title, progress bar, blank-after-bar
 
-    mpv = Mpv(current["url"])
-    mpv.set_af(build_af(eq_gains))
+    mpv = Mpv(state.current["url"])
+    mpv.set_af(build_af(state.eq_gains))
 
-    cur_pl_index = 0  # index of `current` within mpv's own playlist
+    beat_hue = 0.0
+    beat_hue_target = 0.0
+    beat_flash = 0.0
 
-    def resync_playlist():
-        nonlocal cur_pl_index
-        if not current["url"]:
-            return
-        prev_url = history[-1]["url"] if history else None
-        next_url = play_queue[0]["url"] if play_queue else None
-        mpv.sync_playlist(current["url"], prev_url, next_url)
-        cur_pl_index = 1 if prev_url else 0
-
-    def remember(track):
-        history.append(track)
-        del history[:-HISTORY_LIMIT]
-        save_history(history)
-
-    def start_track(track, clear_queue=False):
-        """Make a browsed/favorite track the active track, including startup."""
-        nonlocal current, play_queue, queue_selected, beat_info, next_beat_time, beat_job
-        if current["url"]:
-            remember(current)
-        current = track
-        if clear_queue:
-            play_queue = []
-            queue_selected = 0
-        mpv.load(current["url"])
-        beat_info = None
-        next_beat_time = None
-        beat_job = run_async(analyze_beat, current["url"])
-        resync_playlist()
-
-    def advance(forward):
-        """Move to the next/previous track (queue <-> history), for the
-        Ctrl+Left/Right hotkeys and for playlist-pos-detected OS media-key
-        Next/Previous alike. Returns False (no-op) if there's nowhere to
-        go -- empty queue for forward, empty history for backward."""
-        nonlocal current, browse_selected, browse_job, beat_info, next_beat_time, beat_job, queue_selected
-        if not current["url"]:
-            return False
-        if forward:
-            if not play_queue:
-                return False
-            remember(current)
-            current = play_queue.pop(0)
-        else:
-            if not history:
-                return False
-            play_queue.insert(0, current)
-            current = history.pop()
-            save_history(history)
-        queue_selected = 0
-        beat_info = None
-        next_beat_time = None
-        beat_job = run_async(analyze_beat, current["url"])
-        if browse_source == "mix":
-            browse_selected = 0
-            browse_job = run_async(fetch_mix, current["id"])
-        resync_playlist()
-        return True
-
-    resync_playlist()
+    resync_playlist(state, mpv)
     # Raw ANSI instead of term.fullscreen()/term.hidden_cursor(): those are
     # blessed capability lookups (smcup/rmcup, civis/cnorm) and, like
     # term.home/term.clear before them, can silently no-op on some
@@ -235,15 +439,15 @@ def run(url=None, initial_search=None):
             t0 = time.time()
             prev_dims = None
             while True:
-                if browse_job is not None and browse_job["done"]:
-                    browse_items = browse_job["result"]
-                    browse_selected = 0
-                    browse_job = None
+                if state.browse_job is not None and state.browse_job["done"]:
+                    state.browse_items = state.browse_job["result"]
+                    state.browse_selected = 0
+                    state.browse_job = None
 
-                if beat_job is not None and beat_job["done"]:
-                    beat_info = beat_job["result"]
-                    next_beat_time = None
-                    beat_job = None
+                if state.beat_job is not None and state.beat_job["done"]:
+                    state.beat_info = state.beat_job["result"]
+                    state.next_beat_time = None
+                    state.beat_job = None
 
                 try:
                     mtime = os.path.getmtime(ART_PATH)
@@ -268,8 +472,8 @@ def run(url=None, initial_search=None):
                 # show up the same way: playlist-pos moving away from
                 # cur_pl_index. advance() re-syncs it back afterwards.
                 pl_pos = mpv.get("playlist-pos")
-                if pl_pos is not None and pl_pos != cur_pl_index:
-                    advance(forward=pl_pos > cur_pl_index)
+                if pl_pos is not None and pl_pos != state.cur_pl_index:
+                    advance(state, mpv, forward=pl_pos > state.cur_pl_index)
 
                 width, height = term.width, term.height
                 # Never render into the true last column: some terminals
@@ -300,7 +504,7 @@ def run(url=None, initial_search=None):
                 pre = "\x1b[2J" if (width, height) != prev_dims else ""
                 prev_dims = (width, height)
 
-                if showing_help:
+                if state.showing_help:
                     for line in HELP_TEXT:
                         put((bold(line) if line and line[0] != " " else line)[:w])
                     frame = pre + "".join(f"\x1b[{i + 1};1H{r}{CLEAR_EOL}" for i, r in enumerate(screen_rows)) + "\x1b[J"
@@ -309,10 +513,11 @@ def run(url=None, initial_search=None):
                     key = term.inkey(timeout=0.1)
                     if not key:
                         continue
-                    if key.lower() == "q":
+                    result = handle_help_key(key)
+                    if result == "quit":
                         break
-                    elif key.lower() == "h" or key.name in ("KEY_ESCAPE", "KEY_ENTER") or key == "\x1b":
-                        showing_help = False
+                    if result == "close":
+                        state.showing_help = False
                     continue
 
                 # "Too small" means literally not enough room for the core
@@ -343,7 +548,7 @@ def run(url=None, initial_search=None):
                 # EQ is a dedicated editing window. Give it at least half of
                 # the terminal for the curve and controls, shrinking the
                 # speaker art when the taller variants would crowd it out.
-                if view == "eq":
+                if state.view == "eq":
                     eq_panel = (height + 1) // 2
                     max_eq_visual = height - CORE_LINES - eq_panel
                     for candidate in (art_tall, art_med, art_small):
@@ -352,21 +557,21 @@ def run(url=None, initial_search=None):
                             break
 
                 pos = mpv.get("time-pos")
-                if visual_mode == "beat" and beat_info and pos is not None:
-                    interval = beat_info["interval"]
+                if state.visual_mode == "beat" and state.beat_info and pos is not None:
+                    interval = state.beat_info["interval"]
                     while interval < 2.0:  # keep the pulse under 0.5 Hz so the
                         interval *= 2       # fade between pulses stays visible
                     # Resync if we're not tracking yet or drifted far (e.g.
                     # after a seek), otherwise just check for a beat crossing.
-                    if next_beat_time is None or not (pos - interval < next_beat_time < pos + interval * 4):
-                        phase = beat_info["phase"] % interval
-                        next_beat_time = pos - (pos % interval) + phase
-                        while next_beat_time < pos:
-                            next_beat_time += interval
-                    if pos >= next_beat_time:
+                    if state.next_beat_time is None or not (pos - interval < state.next_beat_time < pos + interval * 4):
+                        phase = state.beat_info["phase"] % interval
+                        state.next_beat_time = pos - (pos % interval) + phase
+                        while state.next_beat_time < pos:
+                            state.next_beat_time += interval
+                    if pos >= state.next_beat_time:
                         beat_hue_target = (beat_hue_target + 0.11) % 1.0
                         beat_flash = 1.0
-                        next_beat_time += interval
+                        state.next_beat_time += interval
                 beat_flash *= 0.85
                 # Ease the displayed hue towards the current target every
                 # frame (shortest way around the color wheel), instead of
@@ -377,7 +582,7 @@ def run(url=None, initial_search=None):
                 beat_hue = (beat_hue + hue_diff * 0.12) % 1.0
 
                 paired_art = pair_speaker(art, w)
-                if visual_mode == "beat":
+                if state.visual_mode == "beat":
                     speaker_lines = render_speakers(paired_art, w, visual_h, 0, beat_hue=beat_hue, beat_flash=beat_flash)
                 else:
                     speaker_lines = render_speakers(paired_art, w, visual_h, time.time() - t0)
@@ -385,12 +590,12 @@ def run(url=None, initial_search=None):
                     put(line)
                 put()
 
-                title_line = f"{current['title']} — {current['channel']}"
-                if current.get("id") in favorites:
+                title_line = f"{state.current['title']} — {state.current['channel']}"
+                if state.current.get("id") in state.favorites:
                     title_line = "★ " + title_line
                 put(bold(title_line[:w]))
 
-                dur = mpv.get("duration") or current.get("duration")
+                dur = mpv.get("duration") or state.current.get("duration")
                 paused = bool(mpv.get("pause"))
                 bar = render_progress_bar(w, pos, dur, paused)
                 put(bar or dim("(too narrow for a progress bar)"))
@@ -401,85 +606,85 @@ def run(url=None, initial_search=None):
                 # shown, and 'p' lets you hide it by choice too.
                 panel_avail = max(0, height - visual_h - CORE_LINES)
                 list_h = 0
-                if panel_hidden:
+                if state.panel_hidden:
                     if panel_avail >= 1:
                         put(dim("(panel hidden — press p to show)"[:w]))
                 elif panel_avail < 1:
                     pass
-                elif typing:
-                    legend = f"Search: {search_buffer}_"[:w]
+                elif state.typing:
+                    legend = f"Search: {state.search_buffer}_"[:w]
                     put(bold(legend))
                     empty_msg = None
                     items, selected = [], 0
                     list_h = panel_avail - 1
-                elif view == "queue":
-                    pos_hint = f" [{queue_selected + 1}/{len(play_queue)}]" if play_queue else ""
+                elif state.view == "queue":
+                    pos_hint = f" [{state.queue_selected + 1}/{len(state.play_queue)}]" if state.play_queue else ""
                     legend = f"Queue{pos_hint}  (↑↓ select · ↵ play now · f favorite current · x remove · b browse · p hide · space pause · q quit)"[:w]
                     put(bold(legend))
-                    items, selected = play_queue, queue_selected
+                    items, selected = state.play_queue, state.queue_selected
                     empty_msg = "(queue is empty — press b to browse and add tracks)"
                     list_h = panel_avail - 1
-                elif view == "eq":
-                    eq_name = EQ_ORDER[eq_selected]
-                    legend = f"EQ: {eq_name.upper()} {eq_gains[eq_name]:+.0f} dB  (←→ select · ↑↓ adjust · r reset · e/b back · q quit)"[:w]
+                elif state.view == "eq":
+                    eq_name = EQ_ORDER[state.eq_selected]
+                    legend = f"EQ: {eq_name.upper()} {state.eq_gains[eq_name]:+.0f} dB  (←→ select · ↑↓ adjust · r reset · e/b back · q quit)"[:w]
                     put(bold(legend))
                     items, selected = None, None
                     empty_msg = None
                     list_h = panel_avail - 1
                     if list_h > 0:
-                        for line in render_eq_curve(eq_gains, eq_name, w, list_h)[:list_h]:
+                        for line in render_eq_curve(state.eq_gains, eq_name, w, list_h)[:list_h]:
                             put(line)
-                elif view == "favorites":
-                    favorite_items = list(favorites.values())
-                    pos_hint = f" [{browse_selected + 1}/{len(favorite_items)}]" if favorite_items else ""
-                    legend = f"Favorites{pos_hint}  (↑↓ select · ↵ play now · x/f remove · b back · q quit)"[:w]
+                elif state.view == "favorites":
+                    favorite_items = list(state.favorites.values())
+                    pos_hint = f" [{state.browse_selected + 1}/{len(favorite_items)}]" if favorite_items else ""
+                    legend = f"Favorites{pos_hint}  (↑↓ select · ↵ play now · x remove · b/F back · q quit)"[:w]
                     put(bold(legend))
-                    items, selected = favorite_items, browse_selected
+                    items, selected = favorite_items, state.browse_selected
                     list_h = panel_avail - 1
                     empty_msg = "(no favorites yet — press f on a track to add one)"
                     if list_h > 0 and items:
                         visible_rows = max(1, list_h - 4)
-                        browse_scroll = clamp_scroll(browse_scroll, selected, len(items), visible_rows)
-                        table = render_table(items, selected, w, list_h, browse_scroll, set(favorites))
-                        table_rows = table or render_plain_list(items, selected, w, list_h, browse_scroll, set(favorites))
+                        state.browse_scroll = clamp_scroll(state.browse_scroll, selected, len(items), visible_rows)
+                        table = render_table(items, selected, w, list_h, state.browse_scroll, set(state.favorites))
+                        table_rows = table or render_plain_list(items, selected, w, list_h, state.browse_scroll, set(state.favorites))
                         for line in table_rows[:list_h]:
                             put(line)
                     elif not items:
                         put(dim(empty_msg))
-                elif view == "history":
-                    history_items = list(reversed(history))
-                    pos_hint = f" [{history_selected + 1}/{len(history_items)}]" if history_items else ""
-                    legend = f"History{pos_hint}  (↑↓ select · ↵ play now · b back · q quit)"[:w]
+                elif state.view == "history":
+                    history_items = list(reversed(state.history))
+                    pos_hint = f" [{state.history_selected + 1}/{len(history_items)}]" if history_items else ""
+                    legend = f"History{pos_hint}  (↑↓ select · ↵ play now · b/H back · q quit)"[:w]
                     put(bold(legend))
-                    items, selected = history_items, history_selected
+                    items, selected = history_items, state.history_selected
                     list_h = panel_avail - 1
                     empty_msg = "(no playback history yet)"
                     if list_h > 0 and items:
                         visible_rows = max(1, list_h - 4)
-                        history_scroll = clamp_scroll(history_scroll, selected, len(items), visible_rows)
-                        table = render_table(items, selected, w, list_h, history_scroll, set(favorites))
-                        table_rows = table or render_plain_list(items, selected, w, list_h, history_scroll, set(favorites))
+                        state.history_scroll = clamp_scroll(state.history_scroll, selected, len(items), visible_rows)
+                        table = render_table(items, selected, w, list_h, state.history_scroll, set(state.favorites))
+                        table_rows = table or render_plain_list(items, selected, w, list_h, state.history_scroll, set(state.favorites))
                         for line in table_rows[:list_h]:
                             put(line)
                     elif not items:
                         put(dim(empty_msg))
                 else:
-                    label = BROWSE_LABELS[browse_source]
-                    pos_hint = f" [{browse_selected + 1}/{len(browse_items)}]" if browse_items else ""
+                    label = BROWSE_LABELS[state.browse_source]
+                    pos_hint = f" [{state.browse_selected + 1}/{len(state.browse_items)}]" if state.browse_items else ""
                     legend = f"Browse: {label}{pos_hint}  (↑↓ select · ↵ queue · c channel · m mix · / search · b back · q quit)"[:w]
                     put(bold(legend))
-                    items, selected = browse_items, browse_selected
+                    items, selected = state.browse_items, state.browse_selected
                     list_h = panel_avail - 1
-                    if browse_job is not None:
+                    if state.browse_job is not None:
                         empty_msg = "(loading…)"
-                    elif browse_source == "channel":
+                    elif state.browse_source == "channel":
                         empty_msg = "(no videos found for this channel)"
-                    elif browse_source == "search":
+                    elif state.browse_source == "search":
                         empty_msg = "(press / to search)"
                     else:
                         empty_msg = "(loading…)"
 
-                if view in ("queue", "browse") and not typing and not panel_hidden and panel_avail >= 1:
+                if state.view in ("queue", "browse") and not state.typing and not state.panel_hidden and panel_avail >= 1:
                     if not items:
                         put(dim(empty_msg))
                     elif list_h > 0:
@@ -490,14 +695,14 @@ def run(url=None, initial_search=None):
                         # most a couple of extra already-fitting rows show
                         # in the fallback case.
                         visible_rows = max(1, list_h - 4)
-                        if view == "queue":
-                            queue_scroll = clamp_scroll(queue_scroll, selected, len(items), visible_rows)
-                            offset = queue_scroll
+                        if state.view == "queue":
+                            state.queue_scroll = clamp_scroll(state.queue_scroll, selected, len(items), visible_rows)
+                            offset = state.queue_scroll
                         else:
-                            browse_scroll = clamp_scroll(browse_scroll, selected, len(items), visible_rows)
-                            offset = browse_scroll
-                        table = render_table(items, selected, w, list_h, offset, set(favorites))
-                        table_rows = table if table else render_plain_list(items, selected, w, list_h, offset, set(favorites))
+                            state.browse_scroll = clamp_scroll(state.browse_scroll, selected, len(items), visible_rows)
+                            offset = state.browse_scroll
+                        table = render_table(items, selected, w, list_h, offset, set(state.favorites))
+                        table_rows = table if table else render_plain_list(items, selected, w, list_h, offset, set(state.favorites))
                         for line in table_rows[:list_h]:
                             put(line)
 
@@ -513,168 +718,7 @@ def run(url=None, initial_search=None):
                 if not key:
                     continue
 
-                if typing:
-                    if key.name == "KEY_ESCAPE" or key == "\x1b":
-                        typing = False
-                    elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
-                        typing = False
-                        if search_buffer.strip():
-                            view = "browse"
-                            browse_source = "search"
-                            browse_items = []
-                            browse_selected = 0
-                            browse_job = run_async(fetch_search, search_buffer.strip())
-                    elif key.name == "KEY_BACKSPACE" or key in ("\x7f", "\x08"):
-                        search_buffer = search_buffer[:-1]
-                    elif not key.is_sequence and key.isprintable():
-                        search_buffer += str(key)
-                    continue
-
-                if key == "h":
-                    showing_help = True
-                    continue
-
-                if key.lower() == "v":
-                    visual_mode = "beat" if visual_mode == "rainbow" else "rainbow"
-                    continue
-
-                if key.name == "KEY_CTRL_LEFT" or key in ("\x1b[1;5D", "\x1b[5D"):
-                    advance(forward=False)
-                    continue
-                if key.name == "KEY_CTRL_RIGHT" or key in ("\x1b[1;5C", "\x1b[5C"):
-                    advance(forward=True)
-                    continue
-
-                if view == "eq":
-                    name = EQ_ORDER[eq_selected]
-                    if key.name == "KEY_LEFT":
-                        eq_selected = (eq_selected - 1) % len(EQ_ORDER)
-                    elif key.name == "KEY_RIGHT":
-                        eq_selected = (eq_selected + 1) % len(EQ_ORDER)
-                    elif key.name == "KEY_UP":
-                        eq_gains[name] = min(EQ_RANGE_DB, eq_gains[name] + 1)
-                        mpv.set_af(build_af(eq_gains))
-                        save_eq(eq_gains)
-                    elif key.name == "KEY_DOWN":
-                        eq_gains[name] = max(-EQ_RANGE_DB, eq_gains[name] - 1)
-                        mpv.set_af(build_af(eq_gains))
-                        save_eq(eq_gains)
-                    elif key.lower() == "r":
-                        eq_gains = {n: 0.0 for n in EQ_ORDER}
-                        mpv.set_af(build_af(eq_gains))
-                        save_eq(eq_gains)
-                    elif key == " ":
-                        mpv.toggle_pause()
-                    elif key.lower() == "p":
-                        panel_hidden = not panel_hidden
-                    elif key.lower() in ("e", "b"):
-                        view = "queue"
-                    elif key.lower() == "q":
-                        break
-                    continue
-
-                if view == "favorites" and key.lower() in ("f", "x"):
-                    favorite_items = list(favorites.values())
-                    if favorite_items:
-                        toggle_favorite(favorites, favorite_items[browse_selected])
-                        favorite_items = list(favorites.values())
-                        browse_selected = min(browse_selected, max(0, len(favorite_items) - 1))
-                    continue
-
-                if key == " ":
-                    mpv.toggle_pause()
-                elif key.name == "KEY_LEFT":
-                    mpv.seek(-15)
-                elif key.name == "KEY_RIGHT":
-                    mpv.seek(15)
-                elif key.name == "KEY_UP":
-                    if view == "queue":
-                        queue_selected = max(0, queue_selected - 1)
-                    elif view == "history":
-                        history_selected = max(0, history_selected - 1)
-                    else:
-                        browse_selected = max(0, browse_selected - 1)
-                elif key.name == "KEY_DOWN":
-                    if view == "queue":
-                        queue_selected = min(len(play_queue) - 1, queue_selected + 1)
-                    elif view == "favorites":
-                        browse_selected = min(len(favorites) - 1, browse_selected + 1)
-                    elif view == "history":
-                        history_selected = min(len(history) - 1, history_selected + 1)
-                    else:
-                        browse_selected = min(len(browse_items) - 1, browse_selected + 1)
-                elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
-                    if view == "queue" and play_queue:
-                        if queue_selected < len(play_queue):
-                            remember(current)
-                            current = play_queue[queue_selected]
-                            play_queue = play_queue[queue_selected + 1:]
-                            queue_selected = 0
-                            beat_info = None
-                            next_beat_time = None
-                            beat_job = run_async(analyze_beat, current["url"])
-                            if browse_source == "mix":
-                                browse_selected = 0
-                                browse_job = run_async(fetch_mix, current["id"])
-                            resync_playlist()
-                    elif view == "browse" and browse_items:
-                        chosen = browse_items[browse_selected]
-                        if not current["url"]:
-                            start_track(chosen)
-                        else:
-                            play_queue.append(chosen)
-                            resync_playlist()
-                    elif view == "favorites" and favorites:
-                        favorite_items = list(favorites.values())
-                        start_track(favorite_items[browse_selected], clear_queue=True)
-                    elif view == "history" and history:
-                        start_track(list(reversed(history))[history_selected], clear_queue=True)
-                elif key.lower() == "x" and view == "queue" and play_queue:
-                    play_queue.pop(queue_selected)
-                    queue_selected = min(queue_selected, max(0, len(play_queue) - 1))
-                    resync_playlist()
-                elif key.lower() == "b":
-                    view = "browse" if view == "queue" else "queue"
-                    if view == "browse" and not browse_items and browse_job is None:
-                        browse_job = run_async(fetch_mix, current["id"])
-                elif key.lower() == "c":
-                    view = "browse"
-                    browse_source = "channel"
-                    browse_items = []
-                    browse_selected = 0
-                    browse_job = run_async(fetch_channel_videos, current.get("channel_url"), current["id"])
-                elif key.lower() == "m":
-                    view = "browse"
-                    browse_source = "mix"
-                    browse_items = []
-                    browse_selected = 0
-                    browse_job = run_async(fetch_mix, current["id"])
-                elif key == "/":
-                    view = "browse"
-                    typing = True
-                    search_buffer = ""
-                elif key.lower() == "e":
-                    view = "eq"
-                    panel_hidden = False
-                elif key == "F":
-                    view = "favorites"
-                    panel_hidden = False
-                    browse_selected = 0
-                    browse_scroll = 0
-                elif key == "H":
-                    view = "history"
-                    panel_hidden = False
-                    history_selected = 0
-                    history_scroll = 0
-                elif key.lower() == "f":
-                    if view == "browse":
-                        if browse_items:
-                            toggle_favorite(favorites, browse_items[browse_selected])
-                    elif view == "queue":
-                        toggle_favorite(favorites, current)
-                elif key.lower() == "p":
-                    panel_hidden = not panel_hidden
-                elif key.lower() == "q":
+                if handle_key(key, state, mpv):
                     break
     except KeyboardInterrupt:
         pass
