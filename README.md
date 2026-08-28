@@ -27,14 +27,18 @@ search again.
 
 Key controls: `Space` pauses, `←`/`→` seek, `Ctrl-←`/`Ctrl-→` change tracks,
 `b` switches between queue and browse, `e` opens the EQ, `f` marks the current
-track in queue view (or the selected browse track), `F` opens Favorites, and
-`q` quits. In Favorites, `Enter`
-plays a track and `f` or `x` removes it. Favorites are stored in
-`config/favorites.json` (or the directory selected by `YTP_CONFIG_DIR`).
+track in queue view (or the selected browse track), `F` opens Favorites, `H`
+opens play History, and `q` quits. In Favorites, `Enter` plays a track and
+`f` or `x` removes it. In History, `Enter` plays back one of the last 25
+tracks played (across restarts too — it's persisted).
 
 The editable defaults live in [`config/`](config/): `eq.json` and the three speaker
-art files. Set `YTP_CONFIG_DIR` to use a different directory; ytp never writes to
-`~/.config/ytp`.
+art files. Set `YTP_CONFIG_DIR` to use a different directory.
+
+Favorites and play history are runtime data, not editable defaults, so they're
+kept out of the repo: `favorites.json` and `history.json` live under
+`$XDG_DATA_HOME/ytp` (typically `~/.local/share/ytp`). Set `YTP_DATA_DIR` to
+use a different directory.
 
 ## Development
 

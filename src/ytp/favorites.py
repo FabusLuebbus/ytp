@@ -3,9 +3,9 @@
 import json
 import os
 
-from .config import CONFIG_DIR
+from .config import DATA_DIR
 
-FAVORITES_PATH = os.path.join(CONFIG_DIR, "favorites.json")
+FAVORITES_PATH = os.path.join(DATA_DIR, "favorites.json")
 
 
 def load_favorites():
@@ -19,7 +19,7 @@ def load_favorites():
 
 
 def save_favorites(favorites):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(FAVORITES_PATH, "w") as f:
         json.dump(favorites, f, indent=2)
 

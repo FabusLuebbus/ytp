@@ -13,6 +13,7 @@ from .art import DEFAULT_ART, DEFAULT_MED_ART, DEFAULT_SMALL_ART, load_art, pair
 from .config import ART_PATH, MED_ART_PATH, SMALL_ART_PATH
 from .eq import EQ_ORDER, EQ_RANGE_DB, build_af, load_eq, save_eq
 from .favorites import load_favorites, toggle_favorite
+from .history import load_history, save_history
 from .mpv import Mpv
 from .render import (
     CLEAR_EOL,
@@ -28,6 +29,8 @@ from .render import (
 from .youtube import fetch_channel_videos, fetch_mix, fetch_search, fetch_video
 
 BROWSE_LABELS = {"mix": "Recommended", "channel": "Same channel", "search": "Search results"}
+
+HISTORY_LIMIT = 25  # how many previously played tracks to keep, for prev/next and the History view
 
 HELP_TEXT = """ytp -- keyboard help  (h, q, enter, or esc to close)
 
@@ -45,6 +48,7 @@ Queue view (default)
   x            remove selected track from queue
   b            switch to browse view
   F            open favorites
+  H            open play history
 
 Browse view (pick what to queue next, without interrupting playback)
   up / down    select track
@@ -59,6 +63,11 @@ Favorites view
   up / down    select favorite
   enter        play favorite now
   x / f        remove favorite
+
+History view
+  up / down    select track
+  enter        play track now
+  b            back to queue view
 
 Equalizer (e to open, from queue or browse)
   <- / ->      select bass / mid / treble
@@ -103,9 +112,12 @@ def run(url=None, initial_search=None):
     play_queue = []
     queue_selected = 0
     queue_scroll = 0
-    history = []  # previously played tracks, most recent last; for prev/next
+    history = load_history()  # previously played tracks, most recent last; for prev/next
+    del history[:-HISTORY_LIMIT]
+    history_selected = 0
+    history_scroll = 0
 
-    view = "queue"  # "queue" | "browse" | "favorites"
+    view = "queue"  # "queue" | "browse" | "favorites" | "history"
     browse_source = "mix"  # "mix" | "channel" | "search"
     browse_items = []
     browse_selected = 0
@@ -155,12 +167,16 @@ def run(url=None, initial_search=None):
         mpv.sync_playlist(current["url"], prev_url, next_url)
         cur_pl_index = 1 if prev_url else 0
 
+    def remember(track):
+        history.append(track)
+        del history[:-HISTORY_LIMIT]
+        save_history(history)
+
     def start_track(track, clear_queue=False):
         """Make a browsed/favorite track the active track, including startup."""
         nonlocal current, play_queue, queue_selected, beat_info, next_beat_time, beat_job
         if current["url"]:
-            history.append(current)
-            del history[:-20]
+            remember(current)
         current = track
         if clear_queue:
             play_queue = []
@@ -182,14 +198,14 @@ def run(url=None, initial_search=None):
         if forward:
             if not play_queue:
                 return False
-            history.append(current)
-            del history[:-20]
+            remember(current)
             current = play_queue.pop(0)
         else:
             if not history:
                 return False
             play_queue.insert(0, current)
             current = history.pop()
+            save_history(history)
         queue_selected = 0
         beat_info = None
         next_beat_time = None
@@ -430,6 +446,23 @@ def run(url=None, initial_search=None):
                             put(line)
                     elif not items:
                         put(dim(empty_msg))
+                elif view == "history":
+                    history_items = list(reversed(history))
+                    pos_hint = f" [{history_selected + 1}/{len(history_items)}]" if history_items else ""
+                    legend = f"History{pos_hint}  (↑↓ select · ↵ play now · b back · q quit)"[:w]
+                    put(bold(legend))
+                    items, selected = history_items, history_selected
+                    list_h = panel_avail - 1
+                    empty_msg = "(no playback history yet)"
+                    if list_h > 0 and items:
+                        visible_rows = max(1, list_h - 4)
+                        history_scroll = clamp_scroll(history_scroll, selected, len(items), visible_rows)
+                        table = render_table(items, selected, w, list_h, history_scroll, set(favorites))
+                        table_rows = table or render_plain_list(items, selected, w, list_h, history_scroll, set(favorites))
+                        for line in table_rows[:list_h]:
+                            put(line)
+                    elif not items:
+                        put(dim(empty_msg))
                 else:
                     label = BROWSE_LABELS[browse_source]
                     pos_hint = f" [{browse_selected + 1}/{len(browse_items)}]" if browse_items else ""
@@ -497,7 +530,7 @@ def run(url=None, initial_search=None):
                         search_buffer += str(key)
                     continue
 
-                if key.lower() == "h":
+                if key == "h":
                     showing_help = True
                     continue
 
@@ -557,6 +590,8 @@ def run(url=None, initial_search=None):
                 elif key.name == "KEY_UP":
                     if view == "queue":
                         queue_selected = max(0, queue_selected - 1)
+                    elif view == "history":
+                        history_selected = max(0, history_selected - 1)
                     else:
                         browse_selected = max(0, browse_selected - 1)
                 elif key.name == "KEY_DOWN":
@@ -564,13 +599,14 @@ def run(url=None, initial_search=None):
                         queue_selected = min(len(play_queue) - 1, queue_selected + 1)
                     elif view == "favorites":
                         browse_selected = min(len(favorites) - 1, browse_selected + 1)
+                    elif view == "history":
+                        history_selected = min(len(history) - 1, history_selected + 1)
                     else:
                         browse_selected = min(len(browse_items) - 1, browse_selected + 1)
                 elif key.name == "KEY_ENTER" or key in ("\n", "\r"):
                     if view == "queue" and play_queue:
                         if queue_selected < len(play_queue):
-                            history.append(current)
-                            del history[:-20]
+                            remember(current)
                             current = play_queue[queue_selected]
                             play_queue = play_queue[queue_selected + 1:]
                             queue_selected = 0
@@ -591,6 +627,8 @@ def run(url=None, initial_search=None):
                     elif view == "favorites" and favorites:
                         favorite_items = list(favorites.values())
                         start_track(favorite_items[browse_selected], clear_queue=True)
+                    elif view == "history" and history:
+                        start_track(list(reversed(history))[history_selected], clear_queue=True)
                 elif key.lower() == "x" and view == "queue" and play_queue:
                     play_queue.pop(queue_selected)
                     queue_selected = min(queue_selected, max(0, len(play_queue) - 1))
@@ -623,6 +661,11 @@ def run(url=None, initial_search=None):
                     panel_hidden = False
                     browse_selected = 0
                     browse_scroll = 0
+                elif key == "H":
+                    view = "history"
+                    panel_hidden = False
+                    history_selected = 0
+                    history_scroll = 0
                 elif key.lower() == "f":
                     if view == "browse":
                         if browse_items:
