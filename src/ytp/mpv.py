@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 from .config import MPRIS_SCRIPT
@@ -25,8 +26,7 @@ class Mpv:
         ]
         if MPRIS_SCRIPT and os.path.exists(MPRIS_SCRIPT):
             cmd.append(f"--script={MPRIS_SCRIPT}")
-        if url:
-            cmd.append(url)
+        self.load_error = None
         self.proc = subprocess.Popen(cmd)
         for _ in range(100):
             if os.path.exists(self.sock):
@@ -35,6 +35,48 @@ class Mpv:
         else:
             raise RuntimeError("mpv IPC socket never appeared")
         time.sleep(0.2)
+        threading.Thread(target=self._watch_events, daemon=True).start()
+        # Loaded over IPC rather than on mpv's command line so the event
+        # listener is already attached if the very first load fails fast.
+        if url:
+            self.load(url)
+
+    def _watch_events(self):
+        """Hold one long-lived IPC connection to catch load failures.
+        _cmd() uses a fresh socket per call, so it never sees mpv's
+        unsolicited events. On a failed load mpv's own end-file event only
+        says "no audio or video data played"; the first warning/error
+        logged since start-file (e.g. "ffmpeg: https: HTTP error 403
+        Forbidden") is the actual cause, so keep that for the message."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(self.sock)
+                s.sendall(b'{"command": ["request_log_messages", "warn"]}\n')
+                cause = None
+                buf = b""
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        return
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, _, buf = buf.partition(b"\n")
+                        try:
+                            msg = json.loads(line)
+                        except ValueError:
+                            continue
+                        event = msg.get("event")
+                        if event == "start-file":
+                            self.load_error = None
+                            cause = None
+                        elif event == "log-message":
+                            if cause is None:
+                                text = msg.get("text", "").strip()
+                                cause = f"{msg.get('prefix')}: {text}"
+                        elif event == "end-file" and msg.get("reason") == "error":
+                            self.load_error = cause or msg.get("file_error") or "loading failed"
+        except OSError:
+            pass
 
     def _cmd(self, command):
         try:

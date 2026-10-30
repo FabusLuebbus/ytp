@@ -22,6 +22,7 @@ from .render import (
     bold,
     clamp_scroll,
     dim,
+    error,
     render_eq_curve,
     render_plain_list,
     render_progress_bar,
@@ -599,7 +600,8 @@ def run(url=None, initial_search=None):
                 paused = bool(mpv.get("pause"))
                 bar = render_progress_bar(w, pos, dur, paused)
                 put(bar or dim("(too narrow for a progress bar)"))
-                put()
+                # The blank line under the bar doubles as the load-error line.
+                put(error(f"⚠ Couldn't play: {mpv.load_error}"[:w]) if mpv.load_error else "")
 
                 # The panel (queue/browse/eq + legend) only gets whatever
                 # room is left after the core; below one line it's just not

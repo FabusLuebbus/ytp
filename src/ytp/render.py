@@ -14,6 +14,7 @@ DIM = "\x1b[2m"
 RESET = "\x1b[0m"
 HIGHLIGHT = "\x1b[30;46m"  # black on cyan
 CLEAR_EOL = "\x1b[K"
+RED = "\x1b[31m"
 
 # Same box-drawing style as the `haspkg` shell function.
 BORDER = "\x1b[38;2;108;112;134m"
@@ -27,6 +28,10 @@ def bold(s):
 
 def dim(s):
     return f"{DIM}{s}{RESET}"
+
+
+def error(s):
+    return f"{RED}{s}{RESET}"
 
 
 def highlight(s):

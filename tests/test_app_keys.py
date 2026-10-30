@@ -23,6 +23,7 @@ class FakeMpv:
         self.afs = []
         self.loaded = []
         self.synced = []
+        self.load_error = None
 
     def toggle_pause(self):
         self.paused += 1
