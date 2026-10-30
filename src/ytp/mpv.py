@@ -9,13 +9,18 @@ import time
 
 from .config import MPRIS_SCRIPT
 
+# Prefer HLS audio: YouTube's plain HTTPS audio URLs 403 unless they carry a
+# &range= query param (yt-dlp's downloader adds it by chunking, mpv's ffmpeg
+# doesn't), while HLS streams play fine. Falls back to bestaudio otherwise.
+YTDL_FORMAT = "bestaudio[protocol=m3u8_native]/bestaudio"
+
 
 class Mpv:
     def __init__(self, url):
         self.sock = os.path.join(tempfile.gettempdir(), f"ytp-mpv-{os.getpid()}.sock")
         cmd = [
             "mpv", "--no-video", "--idle=yes", "--no-terminal",
-            "--really-quiet", "--ytdl-format=bestaudio",
+            "--really-quiet", f"--ytdl-format={YTDL_FORMAT}",
             f"--input-ipc-server={self.sock}",
         ]
         if MPRIS_SCRIPT and os.path.exists(MPRIS_SCRIPT):
